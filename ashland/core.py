@@ -1,6 +1,7 @@
 # The wm, keep ash's windows tiled
 
 from __future__ import annotations
+import fcntl
 import json
 import os
 import socket
@@ -48,6 +49,7 @@ class WindowManager:
         self.lock = threading.RLock()
         self._sessions: dict[str, str] = {}
         self._probe_target: str | None = None
+        self._lock_file = None
         self._timer: threading.Timer | None = None
         self._timer_lock = threading.Lock()  # never hold this across a CDP call
 
@@ -336,18 +338,9 @@ class WindowManager:
             except TypeError as e:
                 return f"bad arguments for {cmd}: {e}"
 
-    def bind_socket(self) -> socket.socket | None:
-        path = socket_path()
-        if os.path.exists(path):
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            probe.settimeout(0.5)
-            try:
-                probe.connect(path)
-                return None
-            except OSError:
-                os.unlink(path)
-            finally:
-                probe.close()
+    def _listen(self, path: str) -> socket.socket:
+        with suppress(FileNotFoundError):
+            os.unlink(path)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(path)
         os.chmod(path, 0o600)
@@ -355,11 +348,28 @@ class WindowManager:
         srv.settimeout(0.5)
         return srv
 
+    def bind_socket(self) -> socket.socket | None:
+        path = socket_path()
+        self._lock_file = open(path + ".lock", "w")
+        try:
+            fcntl.flock(self._lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._lock_file.close()
+            self._lock_file = None
+            return None
+        return self._listen(path)
+
     def serve(self, srv: socket.socket) -> None:
+        path = socket_path()
+        inode = os.stat(path).st_ino
         while self.running:
             try:
                 conn, _ = srv.accept()
             except socket.timeout:
+                if not os.path.exists(path) or os.stat(path).st_ino != inode:
+                    srv.close()
+                    srv = self._listen(path)
+                    inode = os.stat(path).st_ino
                 continue
             try:
                 with conn:

@@ -18,6 +18,7 @@ PLACED_EPSILON_PX = 2
 WORK_AREA_JS = ("JSON.stringify([screen.availLeft|0, screen.availTop|0,"
                 " screen.availWidth, screen.availHeight])")
 DIRECTIONS = {"left": (-1, 0), "right": (1, 0), "up": (0, -1), "down": (0, 1)}
+PROBE_TIMEOUT = 1.5
 
 
 def socket_path() -> str:
@@ -46,6 +47,7 @@ class WindowManager:
         self.running = True
         self.lock = threading.RLock()
         self._sessions: dict[str, str] = {}
+        self._probe_target: str | None = None
         self._timer: threading.Timer | None = None
         self._timer_lock = threading.Lock()  # never hold this across a CDP call
 
@@ -104,26 +106,32 @@ class WindowManager:
 
     def _ask_page_for_work_area(self) -> tuple | None:
         """screen.avail* is ash's work area, shelf excluded, in window-bounds units."""
-        for win in list(self.windows.values()):
-            for tid in win["targets"]:
-                try:
-                    sid = self._sessions.get(tid) or self.cdp.send(
-                        "Target.attachToTarget",
-                        {"targetId": tid, "flatten": True})["sessionId"]
-                    self._sessions[tid] = sid
-                    r = self.cdp.send("Runtime.evaluate",
-                                      {"expression": WORK_AREA_JS, "returnByValue": True},
-                                      session_id=sid)
-                    x, y, w, h = json.loads(r["result"]["value"])
-                    if w and h:
-                        return x, y, w, h
-                except (CDPError, KeyError, ValueError):
-                    self._sessions.pop(tid, None)
+        ordered = [self._probe_target] if self._probe_target else []
+        ordered += [t for win in list(self.windows.values()) for t in win["targets"]
+                    if t != self._probe_target]
+        for tid in ordered:
+            try:
+                sid = self._sessions.get(tid) or self.cdp.send(
+                    "Target.attachToTarget", {"targetId": tid, "flatten": True},
+                    timeout=PROBE_TIMEOUT)["sessionId"]
+                self._sessions[tid] = sid
+                r = self.cdp.send("Runtime.evaluate",
+                                  {"expression": WORK_AREA_JS, "returnByValue": True},
+                                  timeout=PROBE_TIMEOUT, session_id=sid)
+                x, y, w, h = json.loads(r["result"]["value"])
+                if w and h:
+                    self._probe_target = tid
+                    return x, y, w, h
+            except (CDPError, KeyError, ValueError):
+                self._sessions.pop(tid, None)
+                if tid == self._probe_target:
+                    self._probe_target = None
         return None
 
     def get_work_area(self) -> tuple:
-        self.work_area = self._ask_page_for_work_area() or self.work_area or FALLBACK_AREA
-        return self.work_area
+        if not self.work_area:
+            self.work_area = self._ask_page_for_work_area()
+        return self.work_area or FALLBACK_AREA
 
     def watch_display(self, interval: float = 4.0) -> None:
         while self.running:
@@ -328,16 +336,14 @@ class WindowManager:
             except TypeError as e:
                 return f"bad arguments for {cmd}: {e}"
 
-    def serve(self) -> None:
+    def bind_socket(self) -> socket.socket | None:
         path = socket_path()
         if os.path.exists(path):
             probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             probe.settimeout(0.5)
             try:
                 probe.connect(path)
-                print("ashland: another daemon owns the socket", flush=True)
-                self.running = False
-                return
+                return None
             except OSError:
                 os.unlink(path)
             finally:
@@ -347,6 +353,9 @@ class WindowManager:
         os.chmod(path, 0o600)
         srv.listen(8)
         srv.settimeout(0.5)
+        return srv
+
+    def serve(self, srv: socket.socket) -> None:
         while self.running:
             try:
                 conn, _ = srv.accept()
@@ -360,7 +369,7 @@ class WindowManager:
             except Exception as e:
                 print(f"ashland: ipc: {type(e).__name__}: {e}", flush=True)
         srv.close()
-        os.unlink(path)
+        os.unlink(socket_path())
 
 
 def send_command(line: str, timeout: float = 30.0) -> str:

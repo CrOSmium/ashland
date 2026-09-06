@@ -37,10 +37,14 @@ def doctor(cfg: config.Config) -> int:
 
 def daemon(cfg: config.Config, with_keys: bool) -> int:
     wm = WindowManager(cfg)
+    srv = wm.bind_socket()
+    if srv is None:
+        print("ashland: a daemon is already running", flush=True)
+        return 1
     print(f"ashland: connected to {wm.connect()['Browser']}", flush=True)
     print(f"ashland: {wm.retile()}", flush=True)
-    for loop in (wm.serve, wm.watch_display):
-        threading.Thread(target=loop, daemon=True).start()
+    threading.Thread(target=wm.serve, args=(srv,), daemon=True).start()
+    threading.Thread(target=wm.watch_display, daemon=True).start()
     if with_keys:
         from .keys import HotkeyListener
         hotkeys = HotkeyListener(cfg.binds, wm.handle)

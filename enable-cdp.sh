@@ -27,6 +27,7 @@ cp -n "$CONF" "$CONF.ashland.bak" 2>/dev/null || true
 if grep -q '^--remote-debugging-port=' "$CONF"; then
   echo "CDP already enabled in $CONF"
 else
+  sed -i -e '$a\' "$CONF"
   printf -- '--remote-debugging-port=%s\n' "$PORT" >> "$CONF"
   printf -- '--remote-allow-origins=127.0.0.1\n' >> "$CONF"
   echo "added CDP flags to $CONF (backup: $CONF.ashland.bak)"
